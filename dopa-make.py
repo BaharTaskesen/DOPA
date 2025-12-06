@@ -1,30 +1,19 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
+def make_very_easy_means(K):
+    """
+    Very easy stochastic bandit:
+    arm 0 has mean 0.9, all others mean 0.1.
+    """
+    means = np.full(K, 0.1, dtype=float)
+    means[0] = 0.9
+    return means
+
 # ============================================================
 #  Tsallis / DOPA probabilities 
 # ============================================================
 
-# def make_very_easy_means(K):
-#     """
-#     Very easy stochastic bandit:
-#     arm 0 has mean 0.9, all others mean 0.1.
-#     """
-#     means = np.full(K, 0.1, dtype=float)
-#     means[0] = 0.9
-#     return means
-def make_bad_for_exp_means(K, delta=0.02):
-    """
-    Stochastic 
-    mu_1 = 0.5 + delta
-    mu_2 = 0.5
-    mu_k = 0.5 - delta for k >= 3
-    """
-    means = np.full(K, 0.5 - delta, dtype=float)
-    means[0] = 0.5 + delta   # optimal arm
-    if K >= 2:
-        means[1] = 0.5       # strong decoy
-    return means
 
 def tsallis_probs(u, eta, q=0.5, n_iter=60, eps=1e-12):
     '''
@@ -173,9 +162,7 @@ def run_stochastic(
     - Exp3-style baseline (softmax): constant eta_exp
     - Tsallis q = 2 baseline: constant eta_uni
     '''
-    # means = make_stochastic_means(K, gap=gap)
-    means = make_bad_for_exp_means(K, delta=0.02)
-    # means = make_very_easy_means(K)
+    means = make_very_easy_means(K)
     mu_star = means.max()
 
     regrets_tsallis_runs = np.zeros((n_runs, T))
@@ -342,9 +329,11 @@ def run_adversarial(
 # ============================================================
 
 if __name__ == "__main__":
-    T = 20_000
+    T = 10_000
     K = 5
-    n_runs = 5
+    n_runs = 10
+
+    # These are only used for the baselines; Tsallis / DOPA uses eta_t = 2 sqrt(t)
     eta_exp = np.sqrt(T)
     eta_uni = np.sqrt(T)
 
@@ -369,22 +358,22 @@ if __name__ == "__main__":
         seed=seed,
     )
 
-    # # --- Adversarial experiment ---
-    # (
-    #     adv_tsallis_mean,
-    #     adv_tsallis_std,
-    #     adv_exp_mean,
-    #     adv_exp_std,
-    #     adv_uni_mean,
-    #     adv_uni_std,
-    # ) = run_adversarial(
-    #     T=T,
-    #     K=K,
-    #     n_runs=n_runs,
-    #     eta_exp=eta_exp,
-    #     eta_uni=eta_uni,
-    #     seed=seed,
-    # )
+    # --- Adversarial experiment ---
+    (
+        adv_tsallis_mean,
+        adv_tsallis_std,
+        adv_exp_mean,
+        adv_exp_std,
+        adv_uni_mean,
+        adv_uni_std,
+    ) = run_adversarial(
+        T=T,
+        K=K,
+        n_runs=n_runs,
+        eta_exp=eta_exp,
+        eta_uni=eta_uni,
+        seed=seed,
+    )
 
     t = np.arange(1, T + 1)
     z = 1.96  # std is chosen like that for 95% confidence interval
@@ -439,43 +428,43 @@ if __name__ == "__main__":
     # =======================
     plt.subplot(2, 1, 2)
 
-    # se_uni = adv_uni_std / np.sqrt(n_runs)
-    # plt.plot(t, adv_uni_mean, label="DOPA Tsallis (q=2)", color="gray")
-    # plt.fill_between(
-    #     t,
-    #     adv_uni_mean - z * se_uni,
-    #     adv_uni_mean + z * se_uni,
-    #     alpha=0.2,
-    #     color="gray",
-    # )
+    se_uni = adv_uni_std / np.sqrt(n_runs)
+    plt.plot(t, adv_uni_mean, label="DOPA Tsallis (q=2)", color="gray")
+    plt.fill_between(
+        t,
+        adv_uni_mean - z * se_uni,
+        adv_uni_mean + z * se_uni,
+        alpha=0.2,
+        color="gray",
+    )
 
-    # se_exp = adv_exp_std / np.sqrt(n_runs)
-    # plt.plot(t, adv_exp_mean, label="DOPA Exponential",
-    #          linestyle="--", color="green")
-    # plt.fill_between(
-    #     t,
-    #     adv_exp_mean - z * se_exp,
-    #     adv_exp_mean + z * se_exp,
-    #     alpha=0.2,
-    #     color="green",
-    # )
+    se_exp = adv_exp_std / np.sqrt(n_runs)
+    plt.plot(t, adv_exp_mean, label="DOPA Exponential",
+             linestyle="--", color="green")
+    plt.fill_between(
+        t,
+        adv_exp_mean - z * se_exp,
+        adv_exp_mean + z * se_exp,
+        alpha=0.2,
+        color="green",
+    )
 
-    # se_ts = adv_tsallis_std / np.sqrt(n_runs)
-    # plt.plot(t, adv_tsallis_mean, label="DOPA Tsallis (q=1/2)",
-    #          linestyle="-.", color="purple")
-    # plt.fill_between(
-    #     t,
-    #     adv_tsallis_mean - z * se_ts,
-    #     adv_tsallis_mean + z * se_ts,
-    #     alpha=0.2,
-    #     color="purple",
-    # )
+    se_ts = adv_tsallis_std / np.sqrt(n_runs)
+    plt.plot(t, adv_tsallis_mean, label="DOPA Tsallis (q=1/2)",
+             linestyle="-.", color="purple")
+    plt.fill_between(
+        t,
+        adv_tsallis_mean - z * se_ts,
+        adv_tsallis_mean + z * se_ts,
+        alpha=0.2,
+        color="purple",
+    )
 
-    # plt.title("Adversarial environment")
-    # plt.xlabel("Round t")
-    # plt.ylabel("Cumulative regret")
-    # plt.legend()
-    # plt.grid(True, alpha=0.3)
+    plt.title("Adversarial environment")
+    plt.xlabel("Round t")
+    plt.ylabel("Cumulative regret")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig("regret_plot.pdf", bbox_inches="tight")
