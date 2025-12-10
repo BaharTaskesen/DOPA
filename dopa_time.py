@@ -13,7 +13,7 @@ import time
 ############## ============================================================ ##############
 
 
-def tsallis_probs(u, eta, q=0.5,n_iter=60,eps=1e-12):
+def tsallis_probs(u, eta, q=0.5,n_iter=60,eps=1e-8):
     u = np.asarray(u, dtype=float)
     K = u.shape[0]
 
@@ -68,7 +68,7 @@ def tsallis_probs(u, eta, q=0.5,n_iter=60,eps=1e-12):
 #         return np.sinh(s - k)
 # L = sqrt(2)
 
-def hyperbolic_probs(u, eta, n_iter=60, eps=1e-12):
+def hyperbolic_probs(u, eta, n_iter=60, eps=1e-8):
     u = np.asarray(u, dtype=float)
     K = u.shape[0]
 
