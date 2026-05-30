@@ -133,8 +133,10 @@ def run_linucb(env, horizon, alpha=1.0):
     A = np.eye(d)
     b = np.zeros(d)
     regrets = []
+    times = []
     cum_regret = 0
-    
+    start = time.time()
+
     for t in range(horizon):
         # 1. Estimate Theta
         A_inv = np.linalg.inv(A)
@@ -146,22 +148,23 @@ def run_linucb(env, horizon, alpha=1.0):
         variances = np.sum((env.arms @ A_inv) * env.arms, axis=1)
         stds = np.sqrt(variances)
         ucbs = (env.arms @ theta_hat) + alpha * stds
-        
+
         # 3. Action
         action = np.argmax(ucbs)
-        
+
         # 4. Observation
         reward = env.get_reward(action)
         r_step = env.get_regret(action)
         cum_regret += r_step
         regrets.append(cum_regret)
-        
+        times.append(time.time() - start)
+
         # 5. Update
         x = env.arms[action]
         A += np.outer(x, x)
         b += reward * x
-        
-    return np.array(regrets)
+
+    return np.array(regrets), np.array(times)
 
 def solve_op_cvxpy(hat_gaps, arms, block_len, beta_scale, d):
     n = len(hat_gaps)
@@ -270,19 +273,21 @@ def run_op_bandit(env, horizon, beta_scale=1.0, solver='cvxpy'):
     solver: 'cvxpy' or 'pd'
     """
     n, d = env.n_arms, env.dim
-    
+
     regrets = []
+    times = []
     cum_regret = 0
     t = 1
     m = 0
-    
+    start = time.time()
+
     # Global history for Least Squares
     X_hist = []
     y_hist = []
-    
+
     # Initial Estimates
     prev_R_hat = np.zeros(n)
-    
+
     while t <= horizon:
         # 1. Define Block B_m length: 2^m
         block_len = 2**m
@@ -306,10 +311,11 @@ def run_op_bandit(env, horizon, beta_scale=1.0, solver='cvxpy'):
         while t < end_t:
             action = np.random.choice(n, p=dist)
             reward = env.get_reward(action)
-            
+
             cum_regret += env.get_regret(action)
             regrets.append(cum_regret)
-            
+            times.append(time.time() - start)
+
             X_hist.append(env.arms[action])
             y_hist.append(reward)
             t += 1
@@ -325,6 +331,83 @@ def run_op_bandit(env, horizon, beta_scale=1.0, solver='cvxpy'):
         prev_R_hat = env.arms @ theta_hat
             
         m += 1
+
+    return np.array(regrets), np.array(times)
+
+def run_ftrl_shannon(env, horizon, lr=1.0):
+    """
+    Optimistic FTRL with Shannon Entropy (Exponential Weights) for Linear Bandits.
+    Uses Ridge Regression for loss prediction (Optimism).
+    """
+    n, d = env.n_arms, env.dim
+    
+    # State
+    cum_loss_est = np.zeros(n)
+    regrets = []
+    cum_regret = 0
+    
+    # History for predictor
+    X_hist = []
+    y_hist = []
+    
+    # Pre-compute outer products
+    arm_outer_products = np.array([np.outer(a, a) for a in env.arms])
+    
+    for t in range(1, horizon + 1):
+        # Learning rate schedule
+        # eta should scale with 1/sqrt(t)
+        eta = lr * np.sqrt(np.log(n) / (t * d))
+        
+        # Exploration rate schedule
+        gamma = min(0.5, 5.0 * np.sqrt(n * np.log(n) / (t * d)))
+        
+        # 1. Prediction (Optimism)
+        # Predict next loss using Ridge Regression estimate
+        if len(X_hist) > 0:
+            X_mat = np.array(X_hist)
+            y_vec = np.array(y_hist)
+            # Ridge regression (lambda=1e-4)
+            theta_hat = np.linalg.solve(X_mat.T @ X_mat + 1e-4 * np.eye(d), X_mat.T @ y_vec)
+            # Predicted loss = -Predicted Reward
+            pred_loss = -(env.arms @ theta_hat)
+        else:
+            pred_loss = np.zeros(n)
+        
+        # 2. Exponential Weights with Optimism (q_t)
+        # q_t ~ exp(-eta * (L_{1:t-1} + M_t))
+        logits = -eta * (cum_loss_est + pred_loss)
+        logits -= np.max(logits)
+        exp_logits = np.exp(logits)
+        q_t = exp_logits / np.sum(exp_logits)
+        
+        # 3. Mixing with Uniform (p_t)
+        p_t = (1 - gamma) * q_t + gamma * (np.ones(n) / n)
+        
+        # 4. Action Selection
+        action = np.random.choice(n, p=p_t)
+        reward = env.get_reward(action)
+        loss = -reward 
+        
+        cum_regret += env.get_regret(action)
+        regrets.append(cum_regret)
+        
+        # 5. Update History
+        X_hist.append(env.arms[action])
+        y_hist.append(reward)
+        
+        # 6. Loss Estimation
+        Sigma_t = np.tensordot(p_t, arm_outer_products, axes=([0], [0]))
+        Sigma_inv = np.linalg.pinv(Sigma_t + 1e- * np.eye(d))
+        
+        chosen_arm = env.arms[action]
+        intermediate = Sigma_inv @ chosen_arm
+        loss_estimates = (env.arms @ intermediate) * loss
+        
+        # Geometric Clipping
+        clip_val = 100.0 / (gamma + 1e-6)
+        loss_estimates = np.clip(loss_estimates, -clip_val, clip_val)
+        
+        cum_loss_est += loss_estimates
         
     return np.array(regrets)
 
@@ -392,27 +475,30 @@ def run_dusa(env, horizon):
     - Solves optimal allocation for exploration
     """
     n, d = env.n_arms, env.dim
-    
+
     # Initialization
     regrets = []
+    times = []
     cum_regret = 0
-    
+    start = time.time()
+
     # Track statistics
     V_t = np.zeros((d, d))
     b_t = np.zeros(d)
     N_pulls = np.zeros(n)
-    
-    # Force initial exploration 
+
+    # Force initial exploration
     for i in range(n):
         r = env.get_reward(i)
-        
+
         x = env.arms[i]
         V_t += np.outer(x, x)
         b_t += r * x
-        
+
         N_pulls[i] += 1
         cum_regret += env.get_regret(i)
         regrets.append(cum_regret)
+        times.append(time.time() - start)
         
     # State tracking
     s_t = 0 # Counter for exploration rounds (Julia: s)
@@ -492,13 +578,14 @@ def run_dusa(env, horizon):
         reward = env.get_reward(action)
         cum_regret += env.get_regret(action)
         regrets.append(cum_regret)
-        
+        times.append(time.time() - start)
+
         N_pulls[action] += 1
         x_act = env.arms[action]
         V_t += np.outer(x_act, x_act)
         b_t += reward * x_act
-        
-    return np.array(regrets)
+
+    return np.array(regrets), np.array(times)
 
 # ==========================================
 # 3. Simulation Runner
@@ -506,108 +593,138 @@ def run_dusa(env, horizon):
 
 def run_experiment(n_trials=5, horizon=200, mode='paper'):
     print(f"Starting Experiment: {n_trials} trials, T={horizon}, Mode={mode}")
-    
+
     results = {
-        # 'OP (CVXPY)': [],
         'LDOPA': [],
         'LinUCB': [],
-        # 'FTRL-Shannon': [],
         'DuSA': []
     }
-    
+    timings = {
+        'LDOPA': [],
+        'LinUCB': [],
+        'DuSA': []
+    }
+
     execution_times = {
+        'LinUCB': 0.0,
         'LDOPA': 0.0,
         'DuSA': 0.0
     }
-    
+
     for i in range(n_trials):
         print(f"  Trial {i+1}/{n_trials}...")
-        # Use the selected instance (generates new random params every time for 'paper' mode)
         env = LinearBanditEnv(mode=mode, noise_std=0.5)
-        
-        # Run LinUCB
-        # alpha=0.5 often tuned better for small scale problems
-        r_ucb = run_linucb(env, horizon, alpha=0.5) 
-        results['LinUCB'].append(r_ucb)
-        
-        # Run FTRL
-        # r_ftrl = run_ftrl_shannon(env, horizon, lr=5.0)
-        # results['FTRL-Shannon'].append(r_ftrl)
-        
-        # Run OP (CVXPY)
-        # r_op_cvx = run_op_bandit(env, horizon, beta_scale=1.0, solver='cvxpy')
-        # results['OP (CVXPY)'].append(r_op_cvx)
 
-        # Run OP (PD)
-        tic = time.time()
-        r_op_pd = run_op_bandit(env, horizon, beta_scale=1.0, solver='pd')
-        toc = time.time()
+        # Run LinUCB
+        r_ucb, t_ucb = run_linucb(env, horizon, alpha=0.5)
+        results['LinUCB'].append(r_ucb)
+        timings['LinUCB'].append(t_ucb)
+        execution_times['LinUCB'] += t_ucb[-1]
+        print(f"    LinUCB Time: {t_ucb[-1]:.4f}s   Regret: {r_ucb[-1]:.2f}")
+
+        # Run LDOPA (OP-PD)
+        r_op_pd, t_op_pd = run_op_bandit(env, horizon, beta_scale=1.0, solver='pd')
         results['LDOPA'].append(r_op_pd)
-        execution_times['LDOPA'] += (toc - tic)
-        print(f"    LDOPA Time: {toc - tic:.4f}s")
-        print(f"    LDOPA Regret: {r_op_pd[-1]:.2f}"  )
+        timings['LDOPA'].append(t_op_pd)
+        execution_times['LDOPA'] += t_op_pd[-1]
+        print(f"    LDOPA  Time: {t_op_pd[-1]:.4f}s   Regret: {r_op_pd[-1]:.2f}")
+
         # Run DuSA
-        tic = time.time()
-        r_dusa = run_dusa(env, horizon)
-        toc = time.time()
+        r_dusa, t_dusa = run_dusa(env, horizon)
         results['DuSA'].append(r_dusa)
-        execution_times['DuSA'] += (toc - tic)
-        print(f"    DuSA Time: {toc - tic:.4f}s")
-        print(f"    DuSA Regret: {r_dusa[-1]:.2f}"  )
-        
+        timings['DuSA'].append(t_dusa)
+        execution_times['DuSA'] += t_dusa[-1]
+        print(f"    DuSA   Time: {t_dusa[-1]:.4f}s   Regret: {r_dusa[-1]:.2f}")
+
     print("\nTotal Execution Times (over all trials):")
-    print(f"  LDOPA: {execution_times['LDOPA']:.4f}s")
-    print(f"  DuSA:    {execution_times['DuSA']:.4f}s")
+    print(f"  LinUCB: {execution_times['LinUCB']:.4f}s")
+    print(f"  LDOPA:  {execution_times['LDOPA']:.4f}s")
+    print(f"  DuSA:   {execution_times['DuSA']:.4f}s")
     print(f"  Ratio (LDOPA/DuSA): {execution_times['LDOPA']/execution_times['DuSA']:.2f}x\n")
-    return results
+    return results, timings
 
 # ==========================================
 # 4. Plotting
 # ==========================================
 
+COLORS = {
+    'LinUCB': 'green',
+    'LDOPA': 'blue',
+    'DuSA': 'red'
+}
+STYLES = {
+    'LinUCB': '--',
+    'LDOPA': '-',
+    'DuSA': ':'
+}
+
+TITLE_FS = 20
+LABEL_FS = 18
+TICK_FS = 16
+LEGEND_FS = 16
+
+
 def plot_results(results, horizon):
-    plt.figure(figsize=(8,6), dpi=120)
-    
-    colors = {
-        'LinUCB': 'green',
-        # 'FTRL-Shannon': 'purple',
-        # 'OP (CVXPY)': 'cyan',
-        'LDOPA': 'blue',
-        'DuSA': 'red'
-    }
-    styles = {
-        'LinUCB': '--',
-        # 'FTRL-Shannon': '-.',
-        # 'OP (CVXPY)': '-',
-        'LDOPA': '-',
-        'DuSA': ':'
-    }
-    
+    plt.figure(figsize=(8, 6), dpi=120)
+
     x = np.arange(horizon)
-    
+
     for name, data in results.items():
-        if len(data) == 0: continue
+        if len(data) == 0:
+            continue
         data = np.array(data)
-        # Pad with 0 for the warm-start steps if lengths differ
-        # (Our code handles lengths consistently, but just in case)
         if data.shape[1] != horizon:
             print(f"Warning: {name} data length mismatch")
             continue
-            
+
         mean = np.mean(data, axis=0)
         std = np.std(data, axis=0)
-        
-        plt.plot(x, mean, label=name, color=colors[name], linestyle=styles[name], linewidth=2)
-        plt.fill_between(x, mean - 0.5*std, mean + 0.5*std, color=colors[name], alpha=0.2)
-        
-    plt.title("Stochastic Linear Bandit Comparison", fontsize=14)
-    plt.xlabel("Round t", fontsize=14)
-    plt.ylabel("Cumulative Regret", fontsize=14)
+
+        plt.plot(x, mean, label=name, color=COLORS[name], linestyle=STYLES[name], linewidth=2)
+        plt.fill_between(x, mean - 0.5 * std, mean + 0.5 * std, color=COLORS[name], alpha=0.2)
+
+    plt.title("Stochastic Linear Bandit Comparison", fontsize=TITLE_FS)
+    plt.xlabel("Round t", fontsize=LABEL_FS)
+    plt.ylabel("Cumulative Regret", fontsize=LABEL_FS)
+    plt.xticks(fontsize=TICK_FS)
+    plt.yticks(fontsize=TICK_FS)
     plt.grid(True, linestyle=':', alpha=0.6)
-    plt.legend(loc='upper left', fontsize=12)
+    plt.legend(loc='upper left', fontsize=LEGEND_FS)
     plt.tight_layout()
-    plt.savefig(f"lin_bandit_comparison_ldopa_opt.png")
-    plt.show()
+    plt.savefig("lin_bandit_comparison.png")
+
+
+
+def plot_times(timings, horizon):
+    plt.figure(figsize=(8, 6), dpi=120)
+
+    x = np.arange(horizon)
+
+    for name, data in timings.items():
+        if len(data) == 0:
+            continue
+        data = np.array(data)
+        if data.shape[1] != horizon:
+            print(f"Warning: {name} timing length mismatch")
+            continue
+
+        mean = np.mean(data, axis=0)
+        std = np.std(data, axis=0)
+
+        plt.plot(x, mean, label=name, color=COLORS[name], linestyle=STYLES[name], linewidth=2)
+        plt.fill_between(x, mean - 0.5 * std, mean + 0.5 * std, color=COLORS[name], alpha=0.2)
+
+    plt.title("Computational Time vs. Rounds", fontsize=TITLE_FS)
+    plt.xlabel("Round t", fontsize=LABEL_FS)
+    plt.ylabel("Cumulative Wall-Clock Time (s)", fontsize=LABEL_FS)
+    plt.xticks(fontsize=TICK_FS)
+    plt.yticks(fontsize=TICK_FS)
+    plt.yscale('log')
+    plt.grid(True, which='both', linestyle=':', alpha=0.6)
+    plt.legend(loc='upper left', fontsize=LEGEND_FS)
+    plt.tight_layout()
+    plt.savefig("lin_bandit_time_ldopa_opt.png")
+
 
 # ==========================================
 # Main Execution
@@ -617,7 +734,8 @@ if __name__ == "__main__":
     T = 10000
     trials = 100 # As per Section 7.2.1
     
-    data = run_experiment(n_trials=trials, horizon=T, mode='paper')
+    data, timings = run_experiment(n_trials=trials, horizon=T, mode='paper')
     plot_results(data, T)
+    plot_times(timings, T)
 
 
