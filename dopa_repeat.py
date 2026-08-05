@@ -1,8 +1,17 @@
 import numpy as np
 import matplotlib.pyplot as plt
+plt.rcParams.update({
+    'text.usetex': True,
+    'font.family': 'serif',
+    'text.latex.preamble': r'\usepackage{newtxtext,newtxmath}',
+    'legend.fontsize': 17,
+    'axes.labelsize': 16,
+    'xtick.labelsize': 14,
+    'ytick.labelsize': 14,
+})
+from matplotlib.legend_handler import HandlerTuple
 from scipy.special import softmax
 from scipy.optimize import minimize
-import cvxpy as cp
 from sparsemax import Sparsemax
 import torch  # needed to call Sparsemax and convert result to numpy
 from tqdm import trange
@@ -58,94 +67,6 @@ def tsallis_probs(u, eta, q=0.5,n_iter=60,eps=1e-12):
         p /= s
 
     return p
-
-############## ============================================================ ##############
-#  Hyperbolic-FTRL probabilities
-############## ============================================================ ##############
-# F(s) = sinh(s - k) where k = sqrt(2) - 1 - arcsinh(1)
-#         k = np.sqrt(2) - 1.0 - np.arcsinh(1.0)
-#         return np.sinh(s - k)
-# L = sqrt(2)
-
-def hyperbolic_probs(u, eta, n_iter=60, eps=1e-12):
-    u = np.asarray(u, dtype=float)
-    K = u.shape[0]
-
-    # Constants for Hyperbolic
-    k_val = np.sqrt(2) - 1.0 - np.arcsinh(1.0)
-
-    def F(s):
-        return np.sinh(s - k_val)
-
-    def F_k(s):
-        return np.clip(1.0 - F(-s / float(eta)), 0.0, 1.0)
-
-    def F_inv(t):
-        return np.arcsinh(t) + k_val
-
-    Fk_inv_1_minus_1_over_K = -eta * F_inv(1.0 / K)
-
-    offset = Fk_inv_1_minus_1_over_K
-    tau_u = np.max(-u - offset)
-    tau_l = np.min(-u - offset)
-
-    if tau_u < tau_l:
-        tau_u, tau_l = tau_l, tau_u
-
-    tau = 0.5 * (tau_u + tau_l)
-    for _ in range(n_iter):
-        tau = 0.5 * (tau_u + tau_l)
-        p_hat = 1.0 - F_k(-u - tau)
-        if p_hat.sum() > 1.0:
-            tau_u = tau
-        else:
-            tau_l = tau
-
-    F_vals = F_k(-u - tau)
-    S = F_vals.sum()
-    p = (1.0 + S) / K - F_vals
-
-    p = np.maximum(p, 0.0)
-    s = p.sum()
-    if s <= 0:
-        p = np.ones_like(p) / K
-    else:
-        p /= s
-
-    return p
-
-
-############## ============================================================ ##############
-#  Renyi-FTRL probabilities
-############## ============================================================ ##############
-
-def renyi_probs(u, eta, eps_=1e-8):
-
-    u = np.asarray(u, dtype=float)
-    K = u.shape[0]
-
-    p = cp.Variable(K, nonneg=True)
-    t = cp.Variable()
-    # print(np.shape(term_inner))
-    constraints = [cp.sum(p) == 1]
-    objective = cp.Minimize(-u @ p - eta * cp.log(sum(p**0.5)))
-
-    prob = cp.Problem(objective, constraints)
-    prob.solve(solver=cp.MOSEK, eps=eps_)
-    p = p.value
-
-    s = p.sum() 
-    if s <= 0:
-        p = np.ones(K) / K
-    elif s > 1.01:
-        print("Warning: renyi_probs sum > 1.01")
-        print(f"sum={s}, u={u}, eta={eta}, p={p}")
-        p /= s 
-    else:
-        p /= s
-
-    return p
-
 
 # ============================================================
 #  Exponential FTRL: softmax
@@ -218,7 +139,7 @@ def make_adversarial_rewards(T, K):
 
 def run_stochastic(T=5000, K=5, n_runs=20, gap=0.1,
                    eta_tsallis=0.5, eta_exp=0.5, eta_uni=0.5,
-                   alpha=0.1, eta_hyp=0.5, eta_renyi=0.5, seed=0):
+                   alpha=0.1, seed=0):
 
     means = make_stochastic_means(K, gap=gap)
     mu_star = means.max()
@@ -226,8 +147,6 @@ def run_stochastic(T=5000, K=5, n_runs=20, gap=0.1,
 
     # Store regret trajectories per run
     regrets_tsallis_runs = np.zeros((n_runs, T))
-    regrets_hyp_runs = np.zeros((n_runs, T))
-    regrets_renyi_runs = np.zeros((n_runs, T))
     regrets_exp_runs = np.zeros((n_runs, T))
     regrets_uni_runs = np.zeros((n_runs, T))
 
@@ -236,14 +155,10 @@ def run_stochastic(T=5000, K=5, n_runs=20, gap=0.1,
         u_tsallis = np.zeros(K)
         u_exp = np.zeros(K)
         u_uni = np.zeros(K)
-        u_hyp = np.zeros(K)
-        u_renyi = np.zeros(K)
 
         cum_reg_tsallis = 0.0
         cum_reg_exp = 0.0
         cum_reg_uni = 0.0
-        cum_reg_hyp = 0.0
-        cum_reg_renyi = 0.0
 
         for t in range(1, T + 1):
             # Tsallis
@@ -258,28 +173,6 @@ def run_stochastic(T=5000, K=5, n_runs=20, gap=0.1,
             r_t_bandit = r_t - 1.0
             u_tsallis[a_t] += r_t_bandit / p_t[a_t]
             regrets_tsallis_runs[run, t - 1] = cum_reg_tsallis
-
-            # Hyperbolic
-            p_h = hyperbolic_probs(u_hyp, eta=eta_hyp)
-            a_h = rng.choice(K, p=p_h)
-            r_h = 1.0 if rng.random() < means[a_h] else 0.0
-            cum_reg_hyp += mu_star - means[a_h]
-            
-            # Use shifted rewards (r - 1)
-            r_h_bandit = r_h - 1.0
-            u_hyp[a_h] += r_h_bandit / p_h[a_h]
-            regrets_hyp_runs[run, t - 1] = cum_reg_hyp
-
-            # Renyi
-            p_r = renyi_probs(u_renyi, eta=eta_renyi)
-            a_r = rng.choice(K, p=p_r)
-            r_r = 1.0 if rng.random() < means[a_r] else 0.0
-            cum_reg_renyi += mu_star - means[a_r]
-            
-            # Use shifted rewards (r - 1)
-            r_r_bandit = r_r - 1.0
-            u_renyi[a_r] += r_r_bandit / p_r[a_r]
-            regrets_renyi_runs[run, t - 1] = cum_reg_renyi
 
             # Exponential
             p_e = softmax_probs(u_exp, eta=eta_exp)
@@ -318,12 +211,6 @@ def run_stochastic(T=5000, K=5, n_runs=20, gap=0.1,
     sto_tsallis_mean = regrets_tsallis_runs.mean(axis=0)
     sto_tsallis_std  = regrets_tsallis_runs.std(axis=0)
 
-    sto_hyp_mean    = regrets_hyp_runs.mean(axis=0)
-    sto_hyp_std     = regrets_hyp_runs.std(axis=0)
-
-    sto_renyi_mean  = regrets_renyi_runs.mean(axis=0)
-    sto_renyi_std   = regrets_renyi_runs.std(axis=0)
-
     sto_exp_mean     = regrets_exp_runs.mean(axis=0)
     sto_exp_std      = regrets_exp_runs.std(axis=0)
 
@@ -331,13 +218,11 @@ def run_stochastic(T=5000, K=5, n_runs=20, gap=0.1,
     sto_uni_std      = regrets_uni_runs.std(axis=0)
 
     return (sto_tsallis_mean, sto_tsallis_std,
-            sto_hyp_mean,    sto_hyp_std,
-            sto_renyi_mean,  sto_renyi_std,
             sto_exp_mean,    sto_exp_std,
             sto_uni_mean,    sto_uni_std)
 
 def run_adversarial(T=5000, K=5, n_runs=20,
-                    eta_tsallis=0.5, eta_exp=0.5, alpha=0.1, eta_uni=0.5, eta_hyp=0.5, eta_renyi=0.5, seed=0):
+                    eta_tsallis=0.5, eta_exp=0.5, alpha=0.1, eta_uni=0.5, seed=0):
  
     R = make_adversarial_rewards(T, K)
     cum_per_arm = R.sum(axis=0)
@@ -347,8 +232,6 @@ def run_adversarial(T=5000, K=5, n_runs=20,
     regrets_tsallis_runs = np.zeros((n_runs, T))
     regrets_exp_runs = np.zeros((n_runs, T))
     regrets_uni_runs = np.zeros((n_runs, T))
-    regrets_hyp_runs = np.zeros((n_runs, T))
-    regrets_renyi_runs = np.zeros((n_runs, T))
 
     # rng = np.random.default_rng(seed + 1)
 
@@ -357,14 +240,10 @@ def run_adversarial(T=5000, K=5, n_runs=20,
         u_tsallis = np.zeros(K)
         u_exp = np.zeros(K)
         u_uni = np.zeros(K)
-        u_hyp = np.zeros(K)
-        u_renyi = np.zeros(K)
 
         cum_alg_tsallis = 0.0
         cum_alg_exp = 0.0
         cum_alg_uni = 0.0
-        cum_alg_hyp = 0.0
-        cum_alg_renyi = 0.0
 
         for t in range(1, T + 1):
             # Tsallis
@@ -403,33 +282,8 @@ def run_adversarial(T=5000, K=5, n_runs=20,
             u_uni[a_u] += r_u_bandit / p_u[a_u]
             regrets_uni_runs[run, t - 1] = best_cum[t - 1] - cum_alg_uni
 
-            # Hyperbolic
-            p_h = hyperbolic_probs(u_hyp, eta=eta_hyp)
-            a_h = rng.choice(K, p=p_h)
-            r_h = R[t - 1, a_h]
-            cum_alg_hyp += r_h
-            
-            # Use shifted rewards (r - 1)
-            r_h_bandit = r_h - 1.0
-            u_hyp[a_h] += r_h_bandit / p_h[a_h]
-            regrets_hyp_runs[run, t - 1] = best_cum[t - 1] - cum_alg_hyp
-
-            # Renyi
-            p_r = renyi_probs(u_renyi, eta=eta_renyi)
-            a_r = rng.choice(K, p=p_r)
-            r_r = R[t - 1, a_r]
-            cum_alg_renyi += r_r
-            
-            # Use shifted rewards (r - 1)
-            r_r_bandit = r_r - 1.0
-            u_renyi[a_r] += r_r_bandit / p_r[a_r]
-            regrets_renyi_runs[run, t - 1] = best_cum[t - 1] - cum_alg_renyi
-
     adv_tsallis_mean = regrets_tsallis_runs.mean(axis=0)
     adv_tsallis_std  = regrets_tsallis_runs.std(axis=0)
-
-    adv_hyp_mean    = regrets_hyp_runs.mean(axis=0)
-    adv_hyp_std     = regrets_hyp_runs.std(axis=0)
 
     adv_exp_mean     = regrets_exp_runs.mean(axis=0)
     adv_exp_std      = regrets_exp_runs.std(axis=0)
@@ -437,12 +291,7 @@ def run_adversarial(T=5000, K=5, n_runs=20,
     adv_uni_mean     = regrets_uni_runs.mean(axis=0)
     adv_uni_std      = regrets_uni_runs.std(axis=0)
 
-    adv_renyi_mean   = regrets_renyi_runs.mean(axis=0)
-    adv_renyi_std    = regrets_renyi_runs.std(axis=0)
-
     return (adv_tsallis_mean, adv_tsallis_std,
-            adv_hyp_mean,    adv_hyp_std,
-            adv_renyi_mean,  adv_renyi_std,
             adv_exp_mean,    adv_exp_std,
             adv_uni_mean,    adv_uni_std)
 
@@ -453,126 +302,129 @@ def run_adversarial(T=5000, K=5, n_runs=20,
 
 if __name__ == "__main__":
     T = 10000
-    n_runs = 5
-
+    n_runs = 100
     eta_tsallis = 1.0 # calculated inside loop
     eta_exp = np.sqrt(T)
     eta_uni = np.sqrt(T)
-    eta_hyp = np.sqrt(T)
-    eta_renyi = np.sqrt(T)
-
     seed = 1234
     alpha = 0.5
 
     # Define ranges for K and gap
-    K_values = [10]
+    K_values = [2, 5, 10]
     gap_values = [0.05, 0.1, 0.2]
-
-    # Prepare figures: 3 rows (K), 3 columns (gap)
-    fig_sto, axes_sto = plt.subplots(3, 3, figsize=(15, 12))
-    fig_adv, axes_adv = plt.subplots(3, 3, figsize=(15, 12))
 
     t = np.arange(1, T + 1)
     z = 1.96  # for 95 percent conf interval
 
-    for i, K in enumerate(K_values):
-        for j, gap_sto in enumerate(gap_values):
-            print(f"Running experiments: K={K}, gap={gap_sto}")
+    def plot_stoch_panel(ax, res, title, show_ylabel):
+        """Plot one stochastic subplot (band+line for each method); returns legend handles/labels."""
+        uni_m, uni_s, exp_m, exp_s, ts_m, ts_s = res
+        legend_handles = []
+        legend_labels = []
 
-            # --- Stochastic experiment ---
-            (sto_tsallis_mean, sto_tsallis_std, sto_hyp_mean, sto_hyp_std, sto_renyi_mean, sto_renyi_std, sto_exp_mean, sto_exp_std,sto_uni_mean, sto_uni_std) = run_stochastic(
+        def plot_with_band(mean, std, label, color, linestyle="-"):
+            se = std / np.sqrt(n_runs)
+            band = ax.fill_between(t, mean - z * se, mean + z * se, alpha=0.2, color=color)
+            line, = ax.plot(t, mean, color=color, linestyle=linestyle)
+            legend_handles.append((band, line))
+            legend_labels.append(label)
+
+        plot_with_band(uni_m, uni_s, "Uniform", "gray")
+        plot_with_band(exp_m, exp_s, "Exponential", "green", "--")
+        plot_with_band(ts_m, ts_s, r"Pareto ($\alpha=1/2$)", "purple", "-.")
+
+        ax.set_title(title, fontsize=25)
+        ax.set_xlabel(r"Round $t$", fontsize=20)
+        if show_ylabel:
+            ax.set_ylabel("Regret", fontsize=20)
+        ax.tick_params(axis='both', which='major', labelsize=16)
+        ax.grid(True, alpha=0.2)
+        return legend_handles, legend_labels
+
+    # =======================
+    # Stochastic: combined 1x3 figure (K=2,5,10) per gap, screenshot style.
+    # Also cache K=5 results to build a per-gap (delta) figure afterwards.
+    # =======================
+    k5_by_gap = {}
+    for gap_sto in gap_values:
+        fig_sto, axes = plt.subplots(1, 3, figsize=(18, 5))
+        handles, labels = [], []
+
+        for idx, K in enumerate(K_values):
+            print(f"Running stochastic experiment: K={K}, gap={gap_sto}")
+
+            (sto_tsallis_mean, sto_tsallis_std, sto_exp_mean, sto_exp_std,sto_uni_mean, sto_uni_std) = run_stochastic(
                 T=T, K=K, n_runs=n_runs, alpha=alpha, gap=gap_sto,
                 eta_tsallis=eta_tsallis, eta_exp=eta_exp,
-                eta_uni=eta_uni, eta_hyp=eta_hyp, eta_renyi=eta_renyi, seed=seed
+                eta_uni=eta_uni, seed=seed
             )
 
-            # --- Adversarial experiment ---
-            (adv_tsallis_mean, adv_tsallis_std, adv_hyp_mean, adv_hyp_std, adv_renyi_mean, adv_renyi_std, adv_exp_mean, adv_exp_std, adv_uni_mean, adv_uni_std) = run_adversarial(
-                T=T, K=K, n_runs=n_runs, alpha=alpha,
-                eta_tsallis=eta_tsallis, eta_exp=eta_exp,
-                eta_uni=eta_uni, eta_hyp=eta_hyp, eta_renyi=eta_renyi
-            )
+            res = (sto_uni_mean, sto_uni_std, sto_exp_mean, sto_exp_std, sto_tsallis_mean, sto_tsallis_std)
+            if K == 5:
+                k5_by_gap[gap_sto] = res
 
-            # =======================
-            # Plot Stochastic
-            # =======================
-            ax = axes_sto[i, j]
+            lh, ll = plot_stoch_panel(axes[idx], res, f"$K = {K}$", show_ylabel=(idx == 0))
+            if idx == 0:
+                handles, labels = lh, ll
 
-            # Uniform / sparsemax
-            se_uni = sto_uni_std / np.sqrt(n_runs)
-            ax.plot(t, sto_uni_mean, label="Sparsemax", color="gray")
-            ax.fill_between(t, sto_uni_mean - z * se_uni, sto_uni_mean + z * se_uni, alpha=0.2, color="gray")
+        fig_sto.legend(handles, labels, loc='lower center', bbox_to_anchor=(0.5, 0.0),
+                       ncol=3, fontsize=25, handler_map={tuple: HandlerTuple(ndivide=1)})
+        fig_sto.tight_layout()
+        fig_sto.subplots_adjust(bottom=0.28)  # room for the shared legend
+        fig_sto.savefig(f"stoch_gap{gap_sto}.pdf")
+        plt.close(fig_sto)
 
-            # Exponential
-            se_exp = sto_exp_std / np.sqrt(n_runs)
-            ax.plot(t, sto_exp_mean, label="Exponential", linestyle="--", color="green")
-            ax.fill_between(t, sto_exp_mean - z * se_exp, sto_exp_mean + z * se_exp, alpha=0.2, color="green")
+    # =======================
+    # Stochastic (K=5): combined 1x3 figure over gaps (delta = 0.05, 0.1, 0.2)
+    # =======================
+    fig_k5, axes = plt.subplots(1, 3, figsize=(18, 5))
+    handles, labels = [], []
+    for idx, gap_sto in enumerate(gap_values):
+        lh, ll = plot_stoch_panel(axes[idx], k5_by_gap[gap_sto],
+                                  rf"$h = {gap_sto}$", show_ylabel=(idx == 0))
+        if idx == 0:
+            handles, labels = lh, ll
 
-            # Tsallis / Pareto
-            se_ts = sto_tsallis_std / np.sqrt(n_runs)
-            ax.plot(t, sto_tsallis_mean, label="Pareto (q=1/2)", linestyle="-.", color="purple")
-            ax.fill_between(t, sto_tsallis_mean - z * se_ts, sto_tsallis_mean + z * se_ts, alpha=0.2, color="purple")
+    fig_k5.legend(handles, labels, loc='lower center', bbox_to_anchor=(0.5, 0.0),
+                  ncol=3, fontsize=25, handler_map={tuple: HandlerTuple(ndivide=1)})
+    fig_k5.tight_layout()
+    fig_k5.subplots_adjust(bottom=0.28)
+    fig_k5.savefig("stoch_K5_delta.pdf")
+    plt.close(fig_k5)
 
-            # Hyperbolic
-            se_hyp = sto_hyp_std / np.sqrt(n_runs)
-            ax.plot(t, sto_hyp_mean, label="Hyperbolic", linestyle=":", color="blue")
-            ax.fill_between(t, sto_hyp_mean - z * se_hyp, sto_hyp_mean + z * se_hyp, alpha=0.2, color="blue")
+    for K in K_values:
+        # =======================
+        # Adversarial: one PDF per K (gap-independent), no title
+        # =======================
+        print(f"Running adversarial experiment: K={K}")
+        (adv_tsallis_mean, adv_tsallis_std, adv_exp_mean, adv_exp_std, adv_uni_mean, adv_uni_std) = run_adversarial(
+            T=T, K=K, n_runs=n_runs, alpha=alpha,
+            eta_tsallis=eta_tsallis, eta_exp=eta_exp,
+            eta_uni=eta_uni
+        )
 
-            # Renyi
-            se_renyi = sto_renyi_std / np.sqrt(n_runs)
-            ax.plot(t, sto_renyi_mean, label="Renyi", linestyle="-", color="orange")
-            ax.fill_between(t, sto_renyi_mean - z * se_renyi, sto_renyi_mean + z * se_renyi, alpha=0.2, color="orange")
+        fig_adv, ax = plt.subplots(figsize=(7, 5))
 
-            ax.set_title(f"K={K}, gap={gap_sto}")
-            if i == 2: ax.set_xlabel("Round t")
-            if j == 0: ax.set_ylabel("Cumulative Regret")
-            ax.grid(True, alpha=0.3)
-            if i == 0 and j == 0: ax.legend()
+        # Uniform / sparsemax
+        se_uni = adv_uni_std / np.sqrt(n_runs)
+        ax.plot(t, adv_uni_mean, label="Uniform", color="gray")
+        ax.fill_between(t, adv_uni_mean - z * se_uni, adv_uni_mean + z * se_uni, alpha=0.2, color="gray")
 
-            # =======================
-            # Plot Adversarial
-            # =======================
-            ax = axes_adv[i, j]
+        # Exponential
+        se_exp = adv_exp_std / np.sqrt(n_runs)
+        ax.plot(t, adv_exp_mean, label="Exponential", linestyle="--", color="green")
+        ax.fill_between(t, adv_exp_mean - z * se_exp, adv_exp_mean + z * se_exp, alpha=0.2, color="green")
 
-            # Uniform / sparsemax
-            se_uni = adv_uni_std / np.sqrt(n_runs)
-            ax.plot(t, adv_uni_mean, label="Sparsemax", color="gray")
-            ax.fill_between(t, adv_uni_mean - z * se_uni, adv_uni_mean + z * se_uni, alpha=0.2, color="gray")
+        # Tsallis / Pareto
+        se_ts = adv_tsallis_std / np.sqrt(n_runs)
+        ax.plot(t, adv_tsallis_mean, label=r"Pareto ($\alpha=1/2$)", linestyle="-.", color="purple")
+        ax.fill_between(t, adv_tsallis_mean - z * se_ts, adv_tsallis_mean + z * se_ts, alpha=0.2, color="purple")
 
-            # Exponential
-            se_exp = adv_exp_std / np.sqrt(n_runs)
-            ax.plot(t, adv_exp_mean, label="Exponential", linestyle="--", color="green")
-            ax.fill_between(t, adv_exp_mean - z * se_exp, adv_exp_mean + z * se_exp, alpha=0.2, color="green")
+        ax.set_xlabel(r"Round $t$")
+        ax.set_ylabel("Regret", fontsize=20)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
 
-            # Tsallis / Pareto
-            se_ts = adv_tsallis_std / np.sqrt(n_runs)
-            ax.plot(t, adv_tsallis_mean, label="Pareto (q=1/2)", linestyle="-.", color="purple")
-            ax.fill_between(t, adv_tsallis_mean - z * se_ts, adv_tsallis_mean + z * se_ts, alpha=0.2, color="purple")
-            
-            # Hyperbolic
-            se_hyp = adv_hyp_std / np.sqrt(n_runs)
-            ax.plot(t, adv_hyp_mean, label="Hyperbolic", linestyle=":", color="blue")
-            ax.fill_between(t, adv_hyp_mean - z * se_hyp, adv_hyp_mean + z * se_hyp, alpha=0.2, color="blue")
-
-            # Renyi
-            se_renyi = adv_renyi_std / np.sqrt(n_runs)
-            ax.plot(t, adv_renyi_mean, label="Renyi", linestyle="-", color="orange")
-            ax.fill_between(t, adv_renyi_mean - z * se_renyi, adv_renyi_mean + z * se_renyi, alpha=0.2, color="orange")
-
-            ax.set_title(f"K={K}")
-            if i == 2: ax.set_xlabel("Round t")
-            if j == 0: ax.set_ylabel("Cumulative Regret")
-            ax.grid(True, alpha=0.3)
-            if i == 0 and j == 0: ax.legend()
-
-    # Save Stochastic Figure
-    fig_sto.suptitle("Stochastic Environment Regret", fontsize=16)
-    fig_sto.tight_layout(rect=[0, 0.03, 1, 0.95])
-    fig_sto.savefig("stochastic_regrets.pdf")
-    fig_sto.show()
-
-    # Save Adversarial Figure
-    fig_adv.suptitle("Adversarial Environment Regret", fontsize=16)
-    fig_adv.tight_layout(rect=[0, 0.03, 1, 0.95])
-    fig_adv.savefig("adversarial_regrets.pdf")
-    fig_adv.show()
+        fig_adv.tight_layout()
+        fig_adv.savefig(f"adv_K{K}.pdf")
+        plt.close(fig_adv)
